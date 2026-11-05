@@ -19,17 +19,20 @@ namespace BootMonitor
         private readonly DispatcherTimer _monitorTimer;
         private readonly Stopwatch _runtime = Stopwatch.StartNew();
         private PerformanceCounter? _cpuCounter;
-        private PerformanceCounter? _diskIdleCounter;
+        private List<PerformanceCounter>? _diskIdleCounters;   // one per physical disk (not _Total, which averages them)
+        private PerformanceCounter? _diskBytesCounter;          // total disk throughput across all disks
+        private readonly ProcessActivityTracker _activity = new();
         private bool _countersFailed;
         private bool _allTargetsSeen;
         private bool _finished;
 
         // Tuning
         private static readonly TimeSpan TickInterval = TimeSpan.FromSeconds(1.5);
-        private static readonly TimeSpan RequiredStableTime = TimeSpan.FromSeconds(10); // must stay calm this long = ready
+        private static readonly TimeSpan RequiredStableTime = TimeSpan.FromSeconds(30); // must stay calm this long = ready
         private static readonly TimeSpan MaxRuntime = TimeSpan.FromMinutes(15);         // hard cap: never run longer than this
-        private const float CpuIdleThreshold = 20f;   // %
-        private const float DiskBusyThreshold = 15f;  // %
+        private const float CpuIdleThreshold = 20f;        // %
+        private const float DiskBusyThreshold = 15f;       // % active time of the busiest disk
+        private const float DiskThroughputThreshold = 5f;  // MB/s across all disks
 
         private TimeSpan _stableTime = TimeSpan.Zero;
 
@@ -54,8 +57,7 @@ namespace BootMonitor
                 if (_finished)
                 {
                     // Window was closed while counters were initializing
-                    _cpuCounter?.Dispose();
-                    _diskIdleCounter?.Dispose();
+                    DisposeCounters();
                     return;
                 }
                 if (_countersFailed)
@@ -89,10 +91,18 @@ namespace BootMonitor
         {
             _finished = true;
             _monitorTimer.Stop();
+            DisposeCounters();
+        }
+
+        private void DisposeCounters()
+        {
             _cpuCounter?.Dispose();
-            _diskIdleCounter?.Dispose();
+            _diskBytesCounter?.Dispose();
+            if (_diskIdleCounters != null)
+                foreach (var c in _diskIdleCounters) c.Dispose();
             _cpuCounter = null;
-            _diskIdleCounter = null;
+            _diskBytesCounter = null;
+            _diskIdleCounters = null;
         }
 
         // --- Setup --------------------------------------------------------------
@@ -181,15 +191,25 @@ namespace BootMonitor
             try
             {
                 var cpu = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                // "% Idle Time" is far more reliable than "% Disk Time" (which can exceed 100% and spikes wildly)
-                var disk = new PerformanceCounter("PhysicalDisk", "% Idle Time", "_Total");
+                // "% Idle Time" is far more reliable than "% Disk Time" (which can exceed 100% and spikes wildly).
+                // Watch each disk separately: _Total is the average, so one busy disk among several idle ones looks calm.
+                var disks = new List<PerformanceCounter>();
+                foreach (string instance in new PerformanceCounterCategory("PhysicalDisk").GetInstanceNames())
+                {
+                    if (instance == "_Total") continue;
+                    disks.Add(new PerformanceCounter("PhysicalDisk", "% Idle Time", instance));
+                }
+                if (disks.Count == 0) disks.Add(new PerformanceCounter("PhysicalDisk", "% Idle Time", "_Total"));
+                var bytes = new PerformanceCounter("PhysicalDisk", "Disk Bytes/sec", "_Total");
 
                 // Warm up counters (first read always returns 0)
                 cpu.NextValue();
-                disk.NextValue();
+                bytes.NextValue();
+                foreach (var d in disks) d.NextValue();
 
                 _cpuCounter = cpu;
-                _diskIdleCounter = disk;
+                _diskIdleCounters = disks;
+                _diskBytesCounter = bytes;
             }
             catch (Exception ex)
             {
@@ -346,14 +366,18 @@ namespace BootMonitor
                 return;
             }
 
-            if (_cpuCounter == null || _diskIdleCounter == null) return; // counters unavailable: wait for timeout or manual close
+            if (_cpuCounter == null || _diskIdleCounters == null || _diskBytesCounter == null)
+                return; // counters unavailable: wait for timeout or manual close
 
             float cpuLoad;
-            float diskBusy;
+            float diskBusy = 0f;
+            float diskMBps;
             try
             {
                 cpuLoad = _cpuCounter.NextValue();
-                diskBusy = Math.Clamp(100f - _diskIdleCounter.NextValue(), 0f, 100f);
+                foreach (var d in _diskIdleCounters)
+                    diskBusy = Math.Max(diskBusy, Math.Clamp(100f - d.NextValue(), 0f, 100f));
+                diskMBps = _diskBytesCounter.NextValue() / (1024f * 1024f);
             }
             catch
             {
@@ -363,12 +387,14 @@ namespace BootMonitor
             if (!_allTargetsSeen) UpdateStartupItemStatus();
 
             // Count how long resources stay under the "settled" thresholds
-            if (cpuLoad < CpuIdleThreshold && diskBusy < DiskBusyThreshold)
+            bool calm = cpuLoad < CpuIdleThreshold && diskBusy < DiskBusyThreshold && diskMBps < DiskThroughputThreshold;
+            if (calm)
                 _stableTime += TickInterval;
             else
                 _stableTime = TimeSpan.Zero; // reset if hardware spikes again
 
-            TxtSystemMetrics.Text = $"CPU: {cpuLoad:0}%  |  Disk: {diskBusy:0}%  |  Calm: {_stableTime.TotalSeconds:0}/{RequiredStableTime.TotalSeconds:0}s";
+            TxtSystemMetrics.Text = $"CPU: {cpuLoad:0}%  |  Disk: {diskBusy:0}% ({diskMBps:0.0} MB/s)  |  Calm: {_stableTime.TotalSeconds:0}/{RequiredStableTime.TotalSeconds:0}s";
+            TxtBusy.Text = _activity.Sample() is string busy ? $"Busy: {busy}" : "";
 
             if (_stableTime >= RequiredStableTime)
             {
@@ -429,6 +455,7 @@ namespace BootMonitor
             // Leave a static message on screen for 5 minutes (or until closed with the X / Esc), then exit.
             // Task.Delay is just an OS timer: no CPU is used while waiting.
             TxtSystemMetrics.Text = $"Ready at {DateTime.Now:h:mm tt} - this will close in 5 min";
+            TxtBusy.Text = "";
             await Task.Delay(TimeSpan.FromMinutes(5));
             Application.Current?.Shutdown();
         }

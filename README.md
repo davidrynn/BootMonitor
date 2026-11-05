@@ -2,12 +2,13 @@
 
 A tiny Windows widget that tells you when your PC has **actually finished booting**, so you know it's safe to start heavy work like Unity, video editing or a game.
 
-After you log in, Windows keeps loading startup apps, updaters and services for a while. BootMonitor watches CPU and disk activity. Once both stay calm for 10 seconds, it shows **"PC Fully Loaded & Ready!"**.
+After you log in, Windows keeps loading startup apps, updaters and services for a while. BootMonitor watches CPU and disk activity (every disk separately). Once both stay calm for 30 seconds, it shows **"PC Fully Loaded & Ready!"**.
 
 ## Features
 
 - Small always-on-top overlay in the bottom-right corner (drag it anywhere).
 - Live CPU and disk usage, with a countdown to "ready".
+- A **Busy:** line naming whatever is using the most disk I/O and CPU right now. This covers any process, including updaters, services and scheduled tasks that aren't startup entries.
 - Lists your startup programs (from the registry Run keys and the Startup folders) with a status for each:
   - **Active / Running**: seen running.
   - **Disabled**: turned off in Task Manager → Startup apps, so it won't launch. Listed at the bottom.
@@ -23,8 +24,9 @@ After you log in, Windows keeps loading startup apps, updaters and services for 
 | Setting | Default |
 |---|---|
 | CPU below | 20% |
-| Disk busy below | 15% |
-| Must stay calm for | 10 seconds |
+| Busiest disk's active time below | 15% |
+| Total disk throughput below | 5 MB/s |
+| Must stay calm for | 30 seconds |
 | Gives up after | 15 minutes |
 
 These are constants at the top of `MainWindow.xaml.cs`.
