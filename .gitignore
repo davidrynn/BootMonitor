@@ -1,0 +1,19 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Pp]ublish/
+*.zip
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.rsuser
+
+# OS clutter
+Thumbs.db
+Desktop.ini
+.DS_Store
