@@ -1,8 +1,9 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
@@ -197,22 +198,35 @@ namespace BootMonitor
             }
         }
 
+        // --- Startup target discovery -------------------------------------------
+
+        private const string ColorPending = "#FFCC00";
+        private const string ColorRunning = "#4CD964";
+        private const string ColorNotDetected = "#8A8A93";
+        private const string ColorDisabled = "#5A5A63";
+
+        // Where Task Manager records the enabled/disabled state of each startup entry
+        private const string ApprovedBase = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\";
+
         private void LoadStartupTargets()
         {
-            // Scan primary Registry Paths
-            string[] runKeys = { @"Software\Microsoft\Windows\CurrentVersion\Run", @"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run" };
-            foreach (var path in runKeys)
-            {
-                ExtractRegistryItems(Registry.CurrentUser, path);
-                ExtractRegistryItems(Registry.LocalMachine, path);
-            }
+            var found = new List<StartupItem>();
 
-            // Scan Common Directory shortcuts
-            ExtractFolderItems(Environment.SpecialFolder.Startup);
-            ExtractFolderItems(Environment.SpecialFolder.CommonStartup);
+            // Registry Run keys (64-bit and 32-bit views)
+            ExtractRegistryItems(found, Registry.CurrentUser, @"Software\Microsoft\Windows\CurrentVersion\Run", "Run");
+            ExtractRegistryItems(found, Registry.LocalMachine, @"Software\Microsoft\Windows\CurrentVersion\Run", "Run");
+            ExtractRegistryItems(found, Registry.LocalMachine, @"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run", "Run32");
+
+            // Startup folder shortcuts (per-user and all-users)
+            ExtractFolderItems(found, Environment.SpecialFolder.Startup, Registry.CurrentUser);
+            ExtractFolderItems(found, Environment.SpecialFolder.CommonStartup, Registry.LocalMachine);
+
+            // Enabled items first, disabled ones at the bottom
+            foreach (var item in found.OrderBy(i => i.IsDisabled))
+                _startupItems.Add(item);
         }
 
-        private void ExtractRegistryItems(RegistryKey hive, string path)
+        private static void ExtractRegistryItems(List<StartupItem> found, RegistryKey hive, string path, string approvedSubKey)
         {
             try
             {
@@ -222,13 +236,13 @@ namespace BootMonitor
                 {
                     if (name.Contains("BootMonitorApp")) continue; // Skip itself
                     string exeName = GetExeNameFromCommand(key.GetValue(name)?.ToString()) ?? name;
-                    _startupItems.Add(new StartupItem { ProcessName = name, ExeName = exeName, StatusText = "Pending...", StatusColor = "#FFCC00" });
+                    found.Add(CreateItem(name, exeName, IsStartupDisabled(hive, approvedSubKey, name)));
                 }
             }
             catch { /* Access protections */ }
         }
 
-        private void ExtractFolderItems(Environment.SpecialFolder folder)
+        private static void ExtractFolderItems(List<StartupItem> found, Environment.SpecialFolder folder, RegistryKey approvalHive)
         {
             try
             {
@@ -236,12 +250,64 @@ namespace BootMonitor
                 if (!Directory.Exists(path)) return;
                 foreach (var file in Directory.GetFiles(path))
                 {
-                    if (Path.GetFileName(file).Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
-                    string name = Path.GetFileNameWithoutExtension(file);
-                    _startupItems.Add(new StartupItem { ProcessName = name, ExeName = name, StatusText = "Pending...", StatusColor = "#FFCC00" });
+                    string fileName = Path.GetFileName(file);
+                    if (fileName.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string displayName = Path.GetFileNameWithoutExtension(file);
+                    // For shortcuts, match against the program the shortcut launches, not the shortcut's name
+                    string exeName = file.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)
+                        ? ResolveShortcutExeName(file) ?? displayName
+                        : displayName;
+
+                    found.Add(CreateItem(displayName, exeName, IsStartupDisabled(approvalHive, "StartupFolder", fileName)));
                 }
             }
             catch { }
+        }
+
+        private static StartupItem CreateItem(string name, string exeName, bool disabled) => new()
+        {
+            ProcessName = name,
+            ExeName = exeName,
+            IsDisabled = disabled,
+            StatusText = disabled ? "Disabled" : "Pending...",
+            StatusColor = disabled ? ColorDisabled : ColorPending,
+        };
+
+        // Task Manager stores a binary value per entry; an odd first byte (e.g. 0x03) means disabled.
+        private static bool IsStartupDisabled(RegistryKey hive, string approvedSubKey, string valueName)
+        {
+            try
+            {
+                using var key = hive.OpenSubKey(ApprovedBase + approvedSubKey);
+                return key?.GetValue(valueName) is byte[] data && data.Length > 0 && (data[0] & 1) == 1;
+            }
+            catch { return false; }
+        }
+
+        // Reads a .lnk file's target via the Windows Script Host COM object, returning the exe name
+        private static string? ResolveShortcutExeName(string lnkPath)
+        {
+            object? shell = null;
+            object? shortcut = null;
+            try
+            {
+                Type? shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) return null;
+                shell = Activator.CreateInstance(shellType);
+                if (shell == null) return null;
+                shortcut = ((dynamic)shell).CreateShortcut(lnkPath);
+                string? target = shortcut == null ? null : (string?)((dynamic)shortcut).TargetPath;
+                if (string.IsNullOrWhiteSpace(target)) return null;
+                string name = Path.GetFileNameWithoutExtension(target);
+                return string.IsNullOrEmpty(name) ? null : name;
+            }
+            catch { return null; }
+            finally
+            {
+                if (shortcut != null && Marshal.IsComObject(shortcut)) Marshal.ReleaseComObject(shortcut);
+                if (shell != null && Marshal.IsComObject(shell)) Marshal.ReleaseComObject(shell);
+            }
         }
 
         // Extracts the executable name (without extension) from a Run-key command line,
@@ -322,12 +388,12 @@ namespace BootMonitor
             bool allSeen = true;
             foreach (var item in _startupItems)
             {
-                if (item.IsRunning) continue;
+                if (item.IsRunning || item.IsDisabled) continue;
                 if (activeProcesses.Contains(item.ExeName) || activeProcesses.Contains(item.ProcessName))
                 {
                     item.IsRunning = true;
                     item.StatusText = "Active / Running";
-                    item.StatusColor = "#4CD964"; // Green
+                    item.StatusColor = ColorRunning;
                 }
                 else
                 {
@@ -349,13 +415,14 @@ namespace BootMonitor
             BootProgress.Value = 100;
             BootProgress.Foreground = brush;
 
-            // Change remaining unlaunched entries to settled status
+            // Enabled entries that were never seen running: they either ran and exited quickly
+            // (updaters, helpers) or launch under a different process name than we could detect.
             foreach (var item in _startupItems)
             {
-                if (!item.IsRunning)
+                if (!item.IsRunning && !item.IsDisabled)
                 {
-                    item.StatusText = "Passed / Loaded";
-                    item.StatusColor = "#8A8A93";
+                    item.StatusText = "Not detected";
+                    item.StatusColor = ColorNotDetected;
                 }
             }
 
@@ -376,6 +443,7 @@ namespace BootMonitor
         public required string ProcessName { get; init; }
         public required string ExeName { get; init; }
         public bool IsRunning { get; set; }
+        public bool IsDisabled { get; init; }
 
         public string StatusText
         {

@@ -8,7 +8,10 @@ After you log in, Windows keeps loading startup apps, updaters and services for 
 
 - Small always-on-top overlay in the bottom-right corner (drag it anywhere).
 - Live CPU and disk usage, with a countdown to "ready".
-- Lists your startup programs (from the registry Run keys and the Startup folders) and marks each one green when it's running.
+- Lists your startup programs (from the registry Run keys and the Startup folders) with a status for each:
+  - **Active / Running**: seen running.
+  - **Disabled**: turned off in Task Manager → Startup apps, so it won't launch. Listed at the bottom.
+  - **Not detected**: enabled but never seen running. It probably ran and exited quickly (updaters, helpers), or it runs under a different process name.
 - Shows the ready message for 5 minutes, then exits. It uses no CPU while it waits.
 - Closes itself after 15 minutes if your PC never settles.
 - Close it at any time with the **✕** button or **Esc**.
@@ -52,6 +55,17 @@ dotnet publish BootMonitor.csproj -c Release -r win-x64 --self-contained `
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
   -p:EnableCompressionInSingleFile=true -p:DebugType=none -o publish
 ```
+
+## Releasing
+
+Releases are built automatically by GitHub Actions (`.github/workflows/release.yml`). To publish a new version, push a tag:
+
+```powershell
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+GitHub builds the single-file exe on a clean Windows machine, stamps it with the tag's version number, and attaches it to a new release. Every push to `main` is also test-built (`build.yml`).
 
 ## Uninstall
 
